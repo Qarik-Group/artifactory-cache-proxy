@@ -2,7 +2,6 @@ package main
 
 import (
 	"flag"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -22,12 +21,12 @@ func main() {
 	addr := flag.String("addr", ":8080", "proxy listen address")
 
 	cache, err := cache.NewCache(cache.ArtifactoryConfig{
-		URL:        "http://localhost:8081/artifactory",
-		Token:      "AKCp5budTFpbypBqQbGJPz3pGCi28pPivfWczqjfYb9drAmd9LbRZbj6UpKFxJXA8ksWGc9fM",
-		Repository: "proxy",
+		URL:        os.Getenv("ARTIFACTORY_URL"),
+		Token:      os.Getenv("ARTIFACTORY_TOKEN"),
+		Repository: os.Getenv("ARTIFACTORY_REPO"),
 	}, logger)
 	if err != nil {
-		fmt.Println(err)
+		logger.Println(err)
 	}
 
 	flag.Parse()
