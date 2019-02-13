@@ -34,8 +34,9 @@ func main() {
 	proxy = goproxy.NewProxyHttpServer()
 	proxy.Verbose = *verbose
 	proxy.Logger = logger
-	proxy.OnRequest(cache).HandleConnect(goproxy.AlwaysMitm)
-	proxy.OnRequest(cache).Do(cache)
+	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
+	proxy.OnRequest(cache).DoFunc(cache.ReqHandle)
+	proxy.OnResponse(cache).DoFunc(cache.RespHandle)
 
 	log.Fatal(http.ListenAndServe(*addr, proxy))
 }

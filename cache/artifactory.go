@@ -3,6 +3,7 @@ package cache
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -45,7 +46,7 @@ func NewCache(config ArtifactoryConfig, logger *log.Logger) (*Cache, error) {
 	return &cache, nil
 }
 
-func (c *Cache) Handle(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+func (c *Cache) ReqHandle(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
 	url, ok := c.isCached(req)
 	if ok {
 		c.log.Printf("Hitting cache: %s for: %s", url, req.URL.String())
@@ -55,6 +56,27 @@ func (c *Cache) Handle(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request,
 		go c.cache(req, ctx)
 	}
 	return req, nil
+}
+
+func (c *Cache) RespHandle(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
+	if resp.StatusCode == http.StatusFound {
+		location, _ := resp.Location()
+		req, err := http.NewRequest(resp.Request.Method, location.String(), nil)
+		if err != nil {
+			c.log.Printf("Error while creating redirect request for %s: %s",
+				req.URL.String(), err)
+			return nil
+		}
+		c.log.Printf("resp handler: %s", location)
+
+		resp, err = ctx.RoundTrip(req)
+		if err != nil {
+			c.log.Printf("Error while resolving redirect request for %s: %s",
+				req.URL.String(), err)
+			return nil
+		}
+	}
+	return resp
 }
 
 func (c *Cache) HandleReq(req *http.Request, _ *goproxy.ProxyCtx) bool {
@@ -76,7 +98,9 @@ func (c *Cache) cache(req *http.Request, ctx *goproxy.ProxyCtx) {
 		return
 	}
 
-	resp, err := ctx.RoundTrip(creq)
+	client := &http.Client{}
+	client.Transport = ctx
+	resp, err := client.Do(creq)
 	if err != nil {
 		c.log.Printf("Error while performing cache request for %s: %s",
 			req.URL.String(), err)
@@ -94,6 +118,11 @@ func (c *Cache) cache(req *http.Request, ctx *goproxy.ProxyCtx) {
 		c.getCachePath(req),
 		bytes.NewReader(body),
 	)
+
+	sha := sha256.Sum256(body)
+	areq.Header.Add("X-Checksum-Deploy", `true`)
+	areq.Header.Add("X-Checksum-Sha256", fmt.Sprintf("%x", sha))
+
 	if err != nil {
 		c.log.Printf("Error while building artifactory cache request for %s: %s",
 			req.URL.String(), err)
@@ -125,7 +154,12 @@ func (c *Cache) getCacheURL(req *http.Request) *url.URL {
 }
 
 func (c *Cache) getCachePath(req *http.Request) string {
-	return filepath.Join(c.config.Repository, getId(req).String())
+	return filepath.Join(c.config.Repository,
+		req.URL.Hostname(),
+		req.URL.Path,
+		req.URL.RawQuery,
+		getId(req).String(),
+	)
 }
 
 func getId(req *http.Request) uuid.UUID {
