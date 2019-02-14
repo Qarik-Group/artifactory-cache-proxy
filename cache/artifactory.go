@@ -16,19 +16,21 @@ import (
 	"github.com/google/uuid"
 )
 
-type Cache struct {
+type cache struct {
 	client *artifactory.Client
 	log    *log.Logger
 	config ArtifactoryConfig
 }
 
+// ArtifactoryConfig contains configuration to access Artifactory API
 type ArtifactoryConfig struct {
 	URL        string
 	Token      string
 	Repository string
 }
 
-func NewCache(config ArtifactoryConfig, logger *log.Logger) (*Cache, error) {
+// NewCache initializes the cache with an Artifactory API client and a shared logger
+func NewCache(config ArtifactoryConfig, logger *log.Logger) (*cache, error) {
 	tp := artifactory.TokenAuthTransport{Token: config.Token}
 
 	client, err := artifactory.NewClient(config.URL, tp.Client())
@@ -41,12 +43,17 @@ func NewCache(config ArtifactoryConfig, logger *log.Logger) (*Cache, error) {
 		return nil, err
 	}
 
-	cache := Cache{client: client, log: logger, config: config}
+	cache := cache{client: client, log: logger, config: config}
 
 	return &cache, nil
 }
 
-func (c *Cache) ReqHandle(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+// ReqHandle implements the Handle function of the goproxy.ReqHandler
+// upon receiving a request it will check if the response has been cached
+// if so it will update the URL to point to the artifact in Artifactory
+// if not cached it starts a cache action the background
+// in this case the goproxy library takes care of resolving the request
+func (c *cache) ReqHandle(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
 	url, ok := c.isCached(req)
 	if ok {
 		c.log.Printf("Hitting cache: %s for: %s", url, req.URL.String())
@@ -58,7 +65,11 @@ func (c *Cache) ReqHandle(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Reque
 	return req, nil
 }
 
-func (c *Cache) RespHandle(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
+// RespHandle implements the Handle function of the goproxy.RespHandler
+// upon receiving a response it check for a redirect and follows it
+// the resulting response overwrites the received response
+// if there is no redirect this method just returns the original response
+func (c *cache) RespHandle(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
 	if resp.StatusCode == http.StatusFound {
 		location, _ := resp.Location()
 		req, err := http.NewRequest(resp.Request.Method, location.String(), nil)
@@ -79,18 +90,24 @@ func (c *Cache) RespHandle(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Res
 	return resp
 }
 
-func (c *Cache) HandleReq(req *http.Request, _ *goproxy.ProxyCtx) bool {
+// HandleReq has been implemented to satisfy the goproxy.ReqCondition interface
+// it only allows http GET requests to be handled
+func (c *cache) HandleReq(req *http.Request, _ *goproxy.ProxyCtx) bool {
 	if req.Method == http.MethodGet {
 		return true
 	}
 	return false
 }
 
-func (c *Cache) HandleResp(_ *http.Response, _ *goproxy.ProxyCtx) bool {
+// HandleResp has been implemented to satisfy the goproxy.ReqCondition interface
+// since requests are already filtered in HandleReq this method is a noop
+func (c *cache) HandleResp(_ *http.Response, _ *goproxy.ProxyCtx) bool {
 	return true
 }
 
-func (c *Cache) cache(req *http.Request, ctx *goproxy.ProxyCtx) {
+func (c *cache) cache(req *http.Request, ctx *goproxy.ProxyCtx) {
+	// Create new request since incoming request is used by goproxy library
+	// So we should not touch it
 	creq, err := http.NewRequest(req.Method, req.URL.String(), nil)
 	if err != nil {
 		c.log.Printf("Error while creating cache request for %s: %s",
@@ -98,6 +115,7 @@ func (c *Cache) cache(req *http.Request, ctx *goproxy.ProxyCtx) {
 		return
 	}
 
+	// Wrap ctx in http.Client so it follows redirects
 	client := &http.Client{}
 	client.Transport = ctx
 	resp, err := client.Do(creq)
@@ -106,6 +124,8 @@ func (c *Cache) cache(req *http.Request, ctx *goproxy.ProxyCtx) {
 			req.URL.String(), err)
 		return
 	}
+
+	// Read body into variable for later use
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		c.log.Printf("Error while reading cache response body for %s: %s",
@@ -113,22 +133,24 @@ func (c *Cache) cache(req *http.Request, ctx *goproxy.ProxyCtx) {
 		return
 	}
 
+	// Create request to PUT body into Artifactory
 	areq, err := c.client.NewRequest(
 		http.MethodPut,
 		c.getCachePath(req),
 		bytes.NewReader(body),
 	)
-
-	sha := sha256.Sum256(body)
-	areq.Header.Add("X-Checksum-Deploy", `true`)
-	areq.Header.Add("X-Checksum-Sha256", fmt.Sprintf("%x", sha))
-
 	if err != nil {
 		c.log.Printf("Error while building artifactory cache request for %s: %s",
 			req.URL.String(), err)
 		return
 	}
 
+	// Calculate sha256 of body and add Artifactory verification headers
+	sha := sha256.Sum256(body)
+	areq.Header.Add("X-Checksum-Deploy", `true`)
+	areq.Header.Add("X-Checksum-Sha256", fmt.Sprintf("%x", sha))
+
+	// Perform cache request to Artifactory
 	_, err = c.client.Do(context.Background(), areq, nil)
 	if err != nil {
 		c.log.Printf("Error while performing artifactory cache request for %s: %s",
@@ -137,7 +159,7 @@ func (c *Cache) cache(req *http.Request, ctx *goproxy.ProxyCtx) {
 	}
 }
 
-func (c *Cache) isCached(req *http.Request) (*url.URL, bool) {
+func (c *cache) isCached(req *http.Request) (*url.URL, bool) {
 	url := c.getCacheURL(req)
 	hreq, _ := http.NewRequest(http.MethodHead, url.String(), nil)
 	resp, err := c.client.Do(context.Background(), hreq, nil)
@@ -147,13 +169,13 @@ func (c *Cache) isCached(req *http.Request) (*url.URL, bool) {
 	return url, false
 }
 
-func (c *Cache) getCacheURL(req *http.Request) *url.URL {
+func (c *cache) getCacheURL(req *http.Request) *url.URL {
 	url, _ := url.Parse(c.config.URL)
 	url.Path = filepath.Join(url.Path, c.getCachePath(req))
 	return url
 }
 
-func (c *Cache) getCachePath(req *http.Request) string {
+func (c *cache) getCachePath(req *http.Request) string {
 	return filepath.Join(c.config.Repository,
 		req.URL.Hostname(),
 		req.URL.Path,
